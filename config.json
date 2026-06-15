@@ -1,0 +1,1 @@
+{"check_interval": 30, "domestic_apis": ["https://myip.ipip.net", "https://www.cip.cc", "https://ip.sb/geoip"], "foreign_apis": ["https://api.ipify.org?format=json", "https://ipinfo.io/json", "https://api.ip.sb/geoip"], "alert_on_change": true, "alert_sound": true, "timeout": 5}
