@@ -20,7 +20,7 @@ import threading
 import argparse
 import ctypes
 from ctypes import wintypes
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
 
@@ -1303,14 +1303,21 @@ class SystemTrayIcon:
                 root.configure(bg="#f7f8fa")
                 root.protocol("WM_DELETE_WINDOW", root.destroy)
 
+                scale = 1.0
+                try:
+                    if self.app and self.app.widget:
+                        scale = self.app.widget._scale()
+                except Exception:
+                    pass
+                scale = max(1.0, min(scale, 1.45))
                 try:
                     root.tk.call('tk', 'scaling', 1.0)
                 except Exception:
                     pass
-                width = 244
-                row_h = 34
-                pad = 8
-                font = ("微软雅黑", 11)
+                width = int(244 * scale)
+                row_h = int(34 * scale)
+                pad = int(8 * scale)
+                font = ("微软雅黑", max(11, int(11 * scale)))
 
                 frame = tk.Frame(root, bg="#f7f8fa", highlightthickness=1,
                                  highlightbackground="#c9ced6", bd=0)
@@ -1341,7 +1348,7 @@ class SystemTrayIcon:
                     label = tk.Label(frame, text=text, anchor=tk.W, bg="#f7f8fa",
                                      fg="#20242a", font=font, padx=pad * 2,
                                      pady=0, height=1)
-                    label.pack(fill=tk.X, ipady=max(4, row_h // 8))
+                    label.pack(fill=tk.X, ipady=max(5, row_h // 7))
                     label.bind("<Enter>", lambda e, w=label: w.configure(bg="#e6f0ff"))
                     label.bind("<Leave>", lambda e, w=label: w.configure(bg="#f7f8fa"))
                     label.bind("<Button-1>", lambda e, c=cmd_id: invoke(c))
@@ -1364,7 +1371,8 @@ class SystemTrayIcon:
                 root.bind("<Escape>", lambda e: root.destroy())
                 root.bind("<FocusOut>", close_if_focus_lost)
                 root.focus_force()
-                self.app.logger.log(f"[托盘] Tk 菜单显示: pos=({px},{py}) size={menu_w}x{menu_h}")
+                self.app.logger.log(
+                    f"[托盘] Tk 菜单显示: pos=({px},{py}) size={menu_w}x{menu_h} scale={scale}")
                 root.mainloop()
             except Exception as e:
                 self.app.logger.log(f"[托盘] Tk 菜单线程异常: {e}", error=True)
@@ -2481,6 +2489,10 @@ class DetailWindow:
         self._domestic_label = None
         self._foreign_label = None
         self._proxy_label = None
+        self._runtime_label = None
+        self._stats_label = None
+        self._next_label = None
+        self._error_label = None
 
     def _create_window(self):
         """在独立线程中创建详情窗口"""
@@ -2526,6 +2538,25 @@ class DetailWindow:
                                               font=("微软雅黑", 10))
                 self._proxy_label.pack(anchor=tk.W, pady=2)
 
+                runtime_frame = ttk.LabelFrame(main_frame, text="运行详情", padding=10)
+                runtime_frame.pack(fill=tk.X, pady=(0, 10))
+
+                self._runtime_label = ttk.Label(runtime_frame, text="运行状态: 初始化中...",
+                                                font=("微软雅黑", 10), wraplength=900)
+                self._runtime_label.pack(anchor=tk.W, pady=2)
+
+                self._stats_label = ttk.Label(runtime_frame, text="统计: 初始化中...",
+                                              font=("微软雅黑", 10), wraplength=900)
+                self._stats_label.pack(anchor=tk.W, pady=2)
+
+                self._next_label = ttk.Label(runtime_frame, text="下次检测: 计算中...",
+                                             font=("微软雅黑", 10), wraplength=900)
+                self._next_label.pack(anchor=tk.W, pady=2)
+
+                self._error_label = ttk.Label(runtime_frame, text="最近错误: 无",
+                                              font=("微软雅黑", 10), wraplength=900)
+                self._error_label.pack(anchor=tk.W, pady=2)
+
                 hist_frame = ttk.LabelFrame(main_frame, text="变化历史", padding=10)
                 hist_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
@@ -2553,6 +2584,14 @@ class DetailWindow:
                         wrap = max(260, info_frame.winfo_width() - 28)
                         self._domestic_label.configure(wraplength=wrap)
                         self._foreign_label.configure(wraplength=wrap)
+                        if self._runtime_label:
+                            self._runtime_label.configure(wraplength=wrap)
+                        if self._stats_label:
+                            self._stats_label.configure(wraplength=wrap)
+                        if self._next_label:
+                            self._next_label.configure(wraplength=wrap)
+                        if self._error_label:
+                            self._error_label.configure(wraplength=wrap)
                     except Exception:
                         pass
 
@@ -2580,6 +2619,7 @@ class DetailWindow:
             return
         try:
             self._drain_ui_queue()
+            self._refresh_runtime_data()
             self._tk.after(500, self._schedule_poll)
         except Exception:
             pass
@@ -2603,6 +2643,7 @@ class DetailWindow:
         if not self._history_text or not self._status_label:
             return
         result = self.app.last_result
+        self._refresh_runtime_data()
 
         if result:
             self._status_label.config(
@@ -2638,14 +2679,52 @@ class DetailWindow:
                 t = record['time'].strftime('%H:%M:%S')
                 dt = record.get('domestic_ip', '')
                 ft = record.get('foreign_ip', '')
+                old_dt = record.get('old_domestic_ip', '')
+                old_ft = record.get('old_foreign_ip', '')
                 same = record.get('is_same', False)
                 status = '✓' if same else '✗'
                 tp = record.get('type', '')
                 self._history_text.insert(tk.END, f"[{t}] {status} {tp}\n")
-                self._history_text.insert(tk.END, f"    CN: {dt}  EN: {ft}\n\n")
+                if old_dt or old_ft:
+                    self._history_text.insert(tk.END, f"    CN: {old_dt or '-'} -> {dt}\n")
+                    self._history_text.insert(tk.END, f"    EN: {old_ft or '-'} -> {ft}\n\n")
+                else:
+                    self._history_text.insert(tk.END, f"    CN: {dt}  EN: {ft}\n\n")
             if not history:
                 self._history_text.insert(tk.END, "暂无历史记录\n")
             self._history_text.config(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def _refresh_runtime_data(self):
+        """刷新程序运行详情。"""
+        try:
+            if not self._runtime_label:
+                return
+            now = datetime.now()
+            uptime_seconds = max(0, int((now - self.app.start_time).total_seconds()))
+            hours, rem = divmod(uptime_seconds, 3600)
+            minutes, seconds = divmod(rem, 60)
+            uptime_text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            checking_text = "检测中" if self.app._checking else "空闲"
+            self._runtime_label.config(
+                text=f"运行状态: {checking_text}  |  启动时间: {self.app.start_time.strftime('%Y-%m-%d %H:%M:%S')}  |  已运行: {uptime_text}")
+
+            self._stats_label.config(
+                text=(f"统计: 检测 {self.app.check_count} 次，成功 {self.app.check_success_count} 次，"
+                      f"失败 {self.app.check_failure_count} 次，IP变化 {self.app.change_count} 次，"
+                      f"最近耗时 {self.app.last_check_duration:.2f}s"))
+
+            if self.app.next_check_time:
+                remain = max(0, int((self.app.next_check_time - now).total_seconds()))
+                self._next_label.config(
+                    text=f"下次检测: {self.app.next_check_time.strftime('%Y-%m-%d %H:%M:%S')}（约 {remain}s 后）")
+            else:
+                self._next_label.config(text="下次检测: 尚未安排")
+
+            last_error = self.app.last_check_error or "无"
+            color = "red" if self.app.last_check_error else "gray"
+            self._error_label.config(text=f"最近错误: {last_error}", foreground=color)
         except Exception:
             pass
 
@@ -2694,6 +2773,87 @@ class DetailWindow:
         """通知窗口刷新数据（线程安全）"""
         try:
             self._ui_queue.put_nowait(('refresh', None))
+        except Exception:
+            pass
+
+
+# ==================== IP变化告警窗口（子线程模式） ====================
+
+class AlertWindow:
+    """IP变化告警弹窗 - 独立线程创建 Tk，避免阻塞主消息循环。"""
+
+    def __init__(self, app: 'IPMonitorApp'):
+        self.app = app
+        self._thread = None
+        self._tk = None
+        self._queue = queue.Queue()
+
+    def show(self, record: Dict):
+        try:
+            self._queue.put_nowait(record)
+        except Exception:
+            pass
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            record = self._queue.get_nowait()
+        except Exception:
+            return
+        try:
+            self._tk = tk.Tk()
+            self._tk.title("IP变化告警")
+            self._tk.resizable(False, False)
+            _setup_tk_window(self._tk, 520, 300, 420, 260)
+            self._tk.attributes("-topmost", True)
+            self._tk.protocol("WM_DELETE_WINDOW", self._on_close)
+
+            main = ttk.Frame(self._tk, padding=18)
+            main.pack(fill=tk.BOTH, expand=True)
+
+            ttk.Label(main, text="检测到 IP 变化",
+                      font=("微软雅黑", 16, "bold"),
+                      foreground="#d32f2f").pack(anchor=tk.W, pady=(0, 12))
+
+            ttk.Label(main, text=f"变化类型: {record.get('type', '')}",
+                      font=("微软雅黑", 11)).pack(anchor=tk.W, pady=2)
+            ttk.Label(main, text=f"检测时间: {record.get('time').strftime('%Y-%m-%d %H:%M:%S')}",
+                      font=("微软雅黑", 10)).pack(anchor=tk.W, pady=2)
+
+            detail = tk.Text(main, height=5, font=("Consolas", 10), wrap=tk.NONE)
+            detail.pack(fill=tk.BOTH, expand=True, pady=(10, 12))
+            detail.insert(tk.END, f"CN: {record.get('old_domestic_ip') or '-'} -> {record.get('domestic_ip')}\n")
+            detail.insert(tk.END, f"EN: {record.get('old_foreign_ip') or '-'} -> {record.get('foreign_ip')}\n")
+            detail.insert(tk.END, f"状态: {'一致' if record.get('is_same') else '不一致'}\n")
+            detail.configure(state=tk.DISABLED)
+
+            buttons = ttk.Frame(main)
+            buttons.pack(fill=tk.X)
+            ttk.Button(buttons, text="查看详情",
+                       command=lambda: (self.app.detail_window.show(), self._on_close())).pack(side=tk.LEFT)
+            ttk.Button(buttons, text="立即刷新",
+                       command=self.app.manual_check).pack(side=tk.LEFT, padx=(8, 0))
+            ttk.Button(buttons, text="关闭",
+                       command=self._on_close).pack(side=tk.RIGHT)
+
+            self._tk.after(15000, self._on_close)
+            self._tk.mainloop()
+        except Exception as e:
+            try:
+                self.app.logger.log(f"[告警] 弹窗失败: {e}", warning=True)
+            except Exception:
+                pass
+        finally:
+            self._tk = None
+
+    def _on_close(self):
+        try:
+            if self._tk:
+                self._tk.quit()
+                self._tk.destroy()
         except Exception:
             pass
 
@@ -2858,15 +3018,24 @@ class IPMonitorApp:
         self.logger = StartupLogger(os.path.join(exe_dir, "ip_monitor.log"))
 
         self.detail_window = DetailWindow(self)
+        self.alert_window = AlertWindow(self)
         self.settings_window = SettingsWindow(self)
         self.widget = DesktopWidget(self)
         self.tray = None  # 延迟到 widget.show() 之后再创建，避免消息循环未启动
 
+        self.start_time = datetime.now()
         self.last_result: Optional[CheckResult] = None
         self.last_domestic_ip: str = ""
         self.last_foreign_ip: str = ""
         self.change_history: List[Dict] = []
         self.max_history = self.config.get('max_history', 100)
+        self.check_count = 0
+        self.check_success_count = 0
+        self.check_failure_count = 0
+        self.change_count = 0
+        self.last_check_duration = 0.0
+        self.last_check_error = ""
+        self.next_check_time: Optional[datetime] = None
 
         self._timer: Optional[threading.Timer] = None
         self._running = True
@@ -2893,22 +3062,27 @@ class IPMonitorApp:
 
     def _check_for_changes(self, result: CheckResult):
         changed = False
-        change_type = ""
+        change_parts = []
+        old_domestic_ip = self.last_domestic_ip
+        old_foreign_ip = self.last_foreign_ip
 
         if result.domestic.success and result.domestic.ip != "检测失败":
             if self.last_domestic_ip and result.domestic.ip != self.last_domestic_ip:
                 changed = True
-                change_type = "国内IP变化"
+                change_parts.append("国内IP变化")
 
         if result.foreign.success and result.foreign.ip != "检测失败":
             if self.last_foreign_ip and result.foreign.ip != self.last_foreign_ip:
                 changed = True
-                change_type = "国外IP变化" if not change_type else "双重变化"
+                change_parts.append("国外IP变化")
 
         if changed:
+            change_type = "双重变化" if len(change_parts) > 1 else change_parts[0]
             record = {
                 'time': result.timestamp,
                 'type': change_type,
+                'old_domestic_ip': old_domestic_ip,
+                'old_foreign_ip': old_foreign_ip,
                 'domestic_ip': result.domestic.ip,
                 'foreign_ip': result.foreign.ip,
                 'is_same': result.is_same
@@ -2918,14 +3092,31 @@ class IPMonitorApp:
                 self.change_history.append(record)
                 if len(self.change_history) > self.max_history:
                     self.change_history = self.change_history[-self.max_history:]
+                self.change_count += 1
 
             if self.config.get('alert_on_change', True):
-                self._play_alert_sound()
+                self._trigger_change_alert(record)
 
         if result.domestic.success and result.domestic.ip != "检测失败":
             self.last_domestic_ip = result.domestic.ip
         if result.foreign.success and result.foreign.ip != "检测失败":
             self.last_foreign_ip = result.foreign.ip
+
+    def _trigger_change_alert(self, record: Dict):
+        """触发 IP 变化告警：声音、托盘气泡、置顶弹窗、日志。"""
+        try:
+            self._play_alert_sound()
+            title = f"IP变化告警: {record.get('type', '')}"
+            message = (
+                f"CN: {record.get('old_domestic_ip') or '-'} -> {record.get('domestic_ip')}\n"
+                f"EN: {record.get('old_foreign_ip') or '-'} -> {record.get('foreign_ip')}"
+            )
+            self.logger.log(f"[告警] {title} | {message.replace(chr(10), ' | ')}", warning=True)
+            if self.tray:
+                self.tray.show_balloon(title, message)
+            self.alert_window.show(record)
+        except Exception as e:
+            self.logger.log(f"[告警] 触发失败: {e}", warning=True)
 
     def _do_check(self):
         """执行一次IP检测"""
@@ -2935,15 +3126,25 @@ class IPMonitorApp:
             return
 
         self._checking = True
+        started = time.time()
+        self.check_count += 1
+        self.last_check_error = ""
         self.logger.log(f"开始IP检测...")
 
         try:
             result = self.detector.check_both()
+            self.last_check_duration = time.time() - started
 
             with self._lock:
                 self.last_result = result
 
             self._check_for_changes(result)
+            if ((result.domestic.success and result.domestic.ip != "检测失败") or
+                    (result.foreign.success and result.foreign.ip != "检测失败")):
+                self.check_success_count += 1
+            else:
+                self.check_failure_count += 1
+                self.last_check_error = "境内/境外 IP 均检测失败"
 
             # 更新悬浮窗口
             is_normal = result.is_same
@@ -2958,6 +3159,9 @@ class IPMonitorApp:
                 f"状态: {'一致' if result.is_same else '不一致'}")
 
         except Exception as e:
+            self.last_check_duration = time.time() - started
+            self.check_failure_count += 1
+            self.last_check_error = str(e)
             self.logger.log(f"检测过程异常: {e}", error=True)
         finally:
             self._checking = False
@@ -2976,6 +3180,7 @@ class IPMonitorApp:
                 pass
 
         interval = self.config.get('check_interval', 30)
+        self.next_check_time = datetime.now() + timedelta(seconds=interval)
         self._timer = threading.Timer(interval, self._do_check)
         self._timer.daemon = True
         self._timer.start()
@@ -3010,6 +3215,11 @@ class IPMonitorApp:
                 self.detail_window._on_close()
             except Exception:
                 pass
+
+        try:
+            self.alert_window._on_close()
+        except Exception:
+            pass
 
         if self.settings_window.is_visible:
             try:
